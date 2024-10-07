@@ -75,20 +75,26 @@ def handle_stream_response(response: requests.Response, verbose: bool) -> Genera
     content = ""
     for line in response.iter_lines():
         if line:
-            line = line.decode('utf-8')
-            if line.startswith("data: "):
-                if line.strip() == "data: [DONE]":
-                    break
-                data = json.loads(line[6:])
-                if 'choices' in data and len(data['choices']) > 0:
-                    delta = data['choices'][0].get('delta', {})
-                    if 'content' in delta:
-                        content_chunk = delta['content']
-                        content += content_chunk
-                        yield content_chunk
-                elif 'usage' in data and verbose:
-                    usage = ChatCompletionUsage(**data['usage'])
-                    yield from (f"{line}\n" for line in print_metrics(usage))
+            try:
+                line_str = line.decode('utf-8')
+                if line_str.startswith("data: "):
+                    if line_str.strip() == "data: [DONE]":
+                        break
+                    data = json.loads(line_str[6:])
+                    if 'choices' in data and len(data['choices']) > 0:
+                        delta = data['choices'][0].get('delta', {})
+                        if 'content' in delta:
+                            content_chunk = delta['content']
+                            content += content_chunk
+                            yield content_chunk
+                    elif 'usage' in data and verbose:
+                        # Handle the final response with usage information
+                        usage = ChatCompletionUsage(**data['usage'])
+                        yield from (f"{metric_line}\n" for metric_line in print_metrics(usage))
+            except json.JSONDecodeError:
+                print(f"Warning: Failed to parse JSON: {line_str}", file=sys.stderr)
+            except Exception as e:
+                print(f"Error processing stream response: {e}", file=sys.stderr)
 
 def print_messages(messages: list[Message]) -> None:
     print("\n=== Current Messages ===")

@@ -79,6 +79,7 @@ class ChatCompletionChunk(BaseModel):
     created: int
     model: str
     choices: List[Dict[str, Any]]
+    usage: Optional[ChatCompletionUsage] = None
 
 def count_tokens(text, tokenizer):
     return len(tokenizer.encode(text))
@@ -117,6 +118,7 @@ async def generate_stream(prompt: mx.array, request: ChatCompletionRequest) -> A
     response_id = f"chatcmpl-{uuid.uuid4()}"
     start_time = time.time()
     finish_reason = "stop"
+    full_response = ""
 
     for token, _ in generate_step(
         prompt=prompt,
@@ -125,9 +127,11 @@ async def generate_stream(prompt: mx.array, request: ChatCompletionRequest) -> A
         top_p=request.top_p
     ):
         if is_stop_token(token):
+            finish_reason = "stop"
             break
         tokens.append(token)
         new_text = tokenizer.decode([token])
+        full_response += new_text
         
         chunk = ChatCompletionChunk(
             id=response_id,
@@ -156,20 +160,6 @@ async def generate_stream(prompt: mx.array, request: ChatCompletionRequest) -> A
     total_tokens = prompt_tokens + completion_tokens
     tokens_per_second = total_tokens / execution_time if execution_time > 0 else 0
 
-    final_chunk = ChatCompletionChunk(
-        id=response_id,
-        created=created,
-        model=request.model,
-        choices=[
-            {
-                "index": 0,
-                "delta": {},
-                "finish_reason": finish_reason
-            }
-        ]
-    )
-    yield f"data: {json.dumps(final_chunk.model_dump())}\n\n"
-
     usage_info = ChatCompletionUsage(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
@@ -177,7 +167,22 @@ async def generate_stream(prompt: mx.array, request: ChatCompletionRequest) -> A
         execution_time=execution_time,
         tokens_per_second=tokens_per_second
     )
-    yield f"data: {json.dumps({'usage': usage_info.model_dump()})}\n\n"
+
+    final_response = ChatCompletionResponse(
+        id=response_id,
+        object="chat.completion",
+        created=created,
+        model=request.model,
+        choices=[
+            ChatCompletionChoice(
+                index=0,
+                message=ChatCompletionMessage(role="assistant", content=full_response.strip()),
+                finish_reason=finish_reason
+            )
+        ],
+        usage=usage_info
+    )
+    yield f"data: {json.dumps(final_response.model_dump())}\n\n"
     yield "data: [DONE]\n\n"
 
 @app.post("/v1/chat/completions")
