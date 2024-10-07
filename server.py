@@ -6,6 +6,8 @@ from mlx_lm import load, generate
 import logging
 import time
 import uuid
+import argparse
+import os
 
 app = FastAPI()
 
@@ -15,11 +17,20 @@ logger = logging.getLogger(__name__)
 
 # Constants
 MAX_NEW_TOKENS = 4096
+DEFAULT_MODEL_PATH = "/var/tmp/models/mlx-community/Dracarys2-72B-Instruct-4bit"
+
+# Parse command-line arguments
+parser = argparse.ArgumentParser(description="MLX-LM API Server")
+parser.add_argument("-m", "--model", type=str, default=DEFAULT_MODEL_PATH, help="Model path or Hugging Face model name")
+args = parser.parse_args()
 
 # Load model and tokenizer
-logger.info("Loading model and tokenizer...")
-model, tokenizer = load("/var/tmp/models/mlx-community/Dracarys2-72B-Instruct-4bit")
+logger.info(f"Loading model from {args.model}...")
+model, tokenizer = load(args.model)
 logger.info("Model and tokenizer loaded successfully.")
+
+# Extract model name from path or use the full path if it's a Hugging Face model
+MODEL_NAME = os.path.basename(args.model) if os.path.exists(args.model) else args.model
 
 class Message(BaseModel):
     role: str
@@ -92,7 +103,7 @@ def generate_with_metrics(model, tokenizer, prompt, max_new_tokens, **kwargs):
 
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
 async def chat_completions(request: ChatCompletionRequest):
-    if request.model != "Dracarys2-72B-Instruct-4bit":
+    if request.model != MODEL_NAME:
         raise HTTPException(status_code=400, detail="Model not available")
     
     try:
@@ -115,7 +126,7 @@ async def chat_completions(request: ChatCompletionRequest):
         return ChatCompletionResponse(
             id=f"chatcmpl-{uuid.uuid4()}",
             created=int(time.time()),
-            model=request.model,
+            model=MODEL_NAME,
             choices=[
                 ChatCompletionChoice(
                     index=0,
