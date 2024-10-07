@@ -1,1 +1,5 @@
 venv/
+server.out
+server.err
+debug.log
+server.log
