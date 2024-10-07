@@ -71,7 +71,7 @@ def send_request(messages: list[Message], max_new_tokens: Optional[int] = None, 
         print(f"Error: {e}")
         return None
 
-def handle_stream_response(response: requests.Response) -> Generator[str, None, None]:
+def handle_stream_response(response: requests.Response, verbose: bool) -> Generator[str, None, None]:
     content = ""
     for line in response.iter_lines():
         if line:
@@ -86,8 +86,9 @@ def handle_stream_response(response: requests.Response) -> Generator[str, None, 
                         content_chunk = delta['content']
                         content += content_chunk
                         yield content_chunk
-                elif 'usage' in data:
-                    yield f"\n\n=== Generation Metrics ===\n{json.dumps(data['usage'], indent=2)}\n==========================="
+                elif 'usage' in data and verbose:
+                    usage = ChatCompletionUsage(**data['usage'])
+                    yield from (f"{line}\n" for line in print_metrics(usage))
 
 def print_messages(messages: list[Message]) -> None:
     print("\n=== Current Messages ===")
@@ -97,14 +98,14 @@ def print_messages(messages: list[Message]) -> None:
         print("---")
     print("========================\n")
 
-def print_metrics(usage: ChatCompletionUsage) -> None:
-    print("\n=== Generation Metrics ===")
-    print(f"Prompt tokens: {usage.prompt_tokens}")
-    print(f"Completion tokens: {usage.completion_tokens}")
-    print(f"Total tokens: {usage.total_tokens}")
-    print(f"Execution time: {usage.execution_time:.2f} seconds")
-    print(f"Tokens per second: {usage.tokens_per_second:.2f}")
-    print("===========================\n")
+def print_metrics(usage: ChatCompletionUsage) -> Generator[str, None, None]:
+    yield "\n=== Generation Metrics ==="
+    yield f"Prompt tokens: {usage.prompt_tokens}"
+    yield f"Completion tokens: {usage.completion_tokens}"
+    yield f"Total tokens: {usage.total_tokens}"
+    yield f"Execution time: {usage.execution_time:.2f} seconds"
+    yield f"Tokens per second: {usage.tokens_per_second:.2f}"
+    yield "===========================\n"
 
 def main():
     parser = argparse.ArgumentParser(description="CLI for interacting with MLX-LM API")
@@ -137,7 +138,7 @@ def main():
                 if stream_mode:
                     print("Assistant: ", end="", flush=True)
                     full_response = ""
-                    for chunk in handle_stream_response(response):
+                    for chunk in handle_stream_response(response, args.verbose):
                         print(chunk, end="", flush=True)
                         full_response += chunk
                     print()  # New line after streaming completes
@@ -148,7 +149,8 @@ def main():
                         print("\n=== Full API Response ===")
                         print(json.dumps(response_data.model_dump(), indent=2))
                         print("==========================\n")
-                        print_metrics(response_data.usage)
+                        for metric_line in print_metrics(response_data.usage):
+                            print(metric_line)
                     
                     assistant_response = response_data.choices[0].message.content
                     print(f"Assistant: {assistant_response}")

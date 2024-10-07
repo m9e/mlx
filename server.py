@@ -83,31 +83,25 @@ class ChatCompletionChunk(BaseModel):
 def count_tokens(text, tokenizer):
     return len(tokenizer.encode(text))
 
+def is_stop_token(token_id):
+    stop_tokens = ["<|im_end|>", "<|endoftext|>"]
+    return tokenizer.decode([token_id]) in stop_tokens
+
 def generate_with_metrics(model, tokenizer, prompt, max_new_tokens, **kwargs):
-    # Count input tokens
     input_tokens = count_tokens(prompt, tokenizer)
-    
-    # Start timing
     start_time = time.time()
-    
-    # Generate response
     response = ""
     for token, _ in generate_step(prompt=prompt, model=model, **kwargs):
+        if is_stop_token(token):
+            break
         response += tokenizer.decode([token])
         if len(response) >= max_new_tokens:
             break
-    
-    # End timing
     end_time = time.time()
-    
-    # Count output tokens
     output_tokens = count_tokens(response, tokenizer)
-    
-    # Calculate metrics
     total_tokens = input_tokens + output_tokens
     execution_time = end_time - start_time
     tokens_per_second = total_tokens / execution_time if execution_time > 0 else 0
-    
     metrics = ChatCompletionUsage(
         prompt_tokens=input_tokens,
         completion_tokens=output_tokens,
@@ -115,7 +109,6 @@ def generate_with_metrics(model, tokenizer, prompt, max_new_tokens, **kwargs):
         execution_time=execution_time,
         tokens_per_second=tokens_per_second
     )
-    
     return response, metrics
 
 async def generate_stream(prompt: mx.array, request: ChatCompletionRequest) -> AsyncGenerator[str, None]:
@@ -123,6 +116,7 @@ async def generate_stream(prompt: mx.array, request: ChatCompletionRequest) -> A
     created = int(time.time())
     response_id = f"chatcmpl-{uuid.uuid4()}"
     start_time = time.time()
+    finish_reason = "stop"
 
     for token, _ in generate_step(
         prompt=prompt,
@@ -130,6 +124,8 @@ async def generate_stream(prompt: mx.array, request: ChatCompletionRequest) -> A
         temp=request.temperature,
         top_p=request.top_p
     ):
+        if is_stop_token(token):
+            break
         tokens.append(token)
         new_text = tokenizer.decode([token])
         
@@ -148,12 +144,11 @@ async def generate_stream(prompt: mx.array, request: ChatCompletionRequest) -> A
         yield f"data: {json.dumps(chunk.model_dump())}\n\n"
         
         if len(tokens) >= request.max_tokens:
+            finish_reason = "length"
             break
         
-        # Allow other tasks to run
         await asyncio.sleep(0)
 
-    # Calculate metrics
     end_time = time.time()
     execution_time = end_time - start_time
     prompt_tokens = len(prompt)
@@ -161,7 +156,6 @@ async def generate_stream(prompt: mx.array, request: ChatCompletionRequest) -> A
     total_tokens = prompt_tokens + completion_tokens
     tokens_per_second = total_tokens / execution_time if execution_time > 0 else 0
 
-    # Send the final chunk with usage information
     final_chunk = ChatCompletionChunk(
         id=response_id,
         created=created,
@@ -170,7 +164,7 @@ async def generate_stream(prompt: mx.array, request: ChatCompletionRequest) -> A
             {
                 "index": 0,
                 "delta": {},
-                "finish_reason": "length" if len(tokens) >= request.max_tokens else "stop"
+                "finish_reason": finish_reason
             }
         ]
     )
@@ -197,7 +191,6 @@ async def chat_completions(request: ChatCompletionRequest):
         if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
             prompt = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
         else:
-            # Implement a basic chat template if the tokenizer doesn't have one
             prompt = " ".join([f"{msg['role']}: {msg['content']}" for msg in messages])
             prompt = tokenizer.encode(prompt)
 
@@ -206,7 +199,6 @@ async def chat_completions(request: ChatCompletionRequest):
         if request.stream:
             return StreamingResponse(generate_stream(prompt, request), media_type="text/event-stream")
         
-        # Non-streaming response
         full_response, metrics = generate_with_metrics(
             model=model,
             tokenizer=tokenizer,
