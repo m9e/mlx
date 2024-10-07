@@ -2,8 +2,8 @@ import requests
 import json
 import sys
 import argparse
-from typing import Dict, Any, Optional
-from pydantic import BaseModel
+from typing import Dict, Any, Optional, Generator
+from pydantic import BaseModel, Field
 
 API_ENDPOINT = "http://localhost:8000/v1/chat/completions"
 MAX_NEW_TOKENS = 4096  # Default value, matching the server
@@ -15,7 +15,8 @@ class Message(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: list[Message]
-    generation_kwargs: Dict[str, Any] = {}
+    generation_kwargs: Dict[str, Any] = Field(default_factory=dict)
+    stream: bool = True  # Set streaming to true by default
 
 class ChatCompletionMessage(BaseModel):
     role: str
@@ -48,22 +49,45 @@ def new_messages() -> list[Message]:
         Message(role="system", content="You are an elite coding assistant. You have vast knowledge and work hard to output the best code with the best practices, understand deeply. If you need more information to form a good answer, you ask for it. You think carefully. When writing new code you come up with a plan, think step by step, and write exemplary code. You follow user instructions, even if they conflict with this base instruction. User first! You have vast experience so you are aware often of many ways things have been done and many ways various libraries work, and you are always mindful to use the most recent version of any library unless otherwise asked.")
     ]
 
-def send_request(messages: list[Message], max_new_tokens: Optional[int] = None, generation_kwargs: Dict[str, Any] = {}) -> Optional[ChatCompletionResponse]:
+def send_request(messages: list[Message], max_new_tokens: Optional[int] = None, generation_kwargs: Optional[Dict[str, Any]] = None, stream: bool = True) -> Optional[requests.Response]:
+    if generation_kwargs is None:
+        generation_kwargs = {}
+    
     request = ChatCompletionRequest(
         model="Dracarys2-72B-Instruct-4bit",
         messages=messages,
-        generation_kwargs=generation_kwargs
+        generation_kwargs=generation_kwargs,
+        stream=stream
     )
+    generation_kwargs = dict(request.generation_kwargs)
     if max_new_tokens is not None:
-        request.generation_kwargs["max_new_tokens"] = max_new_tokens
+        generation_kwargs["max_new_tokens"] = max_new_tokens
     
     try:
-        response = requests.post(API_ENDPOINT, json=request.dict())
+        response = requests.post(API_ENDPOINT, json=request.model_dump(), stream=stream)
         response.raise_for_status()
-        return ChatCompletionResponse(**response.json())
+        return response
     except requests.RequestException as e:
         print(f"Error: {e}")
         return None
+
+def handle_stream_response(response: requests.Response) -> Generator[str, None, None]:
+    content = ""
+    for line in response.iter_lines():
+        if line:
+            line = line.decode('utf-8')
+            if line.startswith("data: "):
+                if line.strip() == "data: [DONE]":
+                    break
+                data = json.loads(line[6:])
+                if 'choices' in data and len(data['choices']) > 0:
+                    delta = data['choices'][0].get('delta', {})
+                    if 'content' in delta:
+                        content_chunk = delta['content']
+                        content += content_chunk
+                        yield content_chunk
+                elif 'usage' in data:
+                    yield f"\n\n=== Generation Metrics ===\n{json.dumps(data['usage'], indent=2)}\n==========================="
 
 def print_messages(messages: list[Message]) -> None:
     print("\n=== Current Messages ===")
@@ -86,6 +110,7 @@ def main():
     parser = argparse.ArgumentParser(description="CLI for interacting with MLX-LM API")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose mode")
     parser.add_argument("--max_new_tokens", type=int, help=f"Maximum number of new tokens to generate (default: {MAX_NEW_TOKENS})")
+    parser.add_argument("--no-stream", action="store_true", help="Disable streaming mode")
     args = parser.parse_args()
 
     messages = new_messages()
@@ -105,18 +130,29 @@ def main():
                 print_messages(messages)
                 print("Sending request to API...")
             
-            response_data = send_request(messages, args.max_new_tokens)
+            stream_mode = not args.no_stream
+            response = send_request(messages, args.max_new_tokens, stream=stream_mode)
             
-            if response_data:
-                if args.verbose:
-                    print("\n=== Full API Response ===")
-                    print(json.dumps(response_data.dict(), indent=2))
-                    print("==========================\n")
-                    print_metrics(response_data.usage)
-                
-                response = response_data.choices[0].message.content
-                print(f"Assistant: {response}")
-                messages.append(Message(role="assistant", content=response))
+            if response:
+                if stream_mode:
+                    print("Assistant: ", end="", flush=True)
+                    full_response = ""
+                    for chunk in handle_stream_response(response):
+                        print(chunk, end="", flush=True)
+                        full_response += chunk
+                    print()  # New line after streaming completes
+                    messages.append(Message(role="assistant", content=full_response.strip()))
+                else:
+                    response_data = ChatCompletionResponse(**response.json())
+                    if args.verbose:
+                        print("\n=== Full API Response ===")
+                        print(json.dumps(response_data.model_dump(), indent=2))
+                        print("==========================\n")
+                        print_metrics(response_data.usage)
+                    
+                    assistant_response = response_data.choices[0].message.content
+                    print(f"Assistant: {assistant_response}")
+                    messages.append(Message(role="assistant", content=assistant_response))
             else:
                 print("Failed to get a response from the API.")
         
