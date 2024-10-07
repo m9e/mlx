@@ -1,115 +1,130 @@
-import asyncio
-from mlx_lm import load, generate
-import os
+import requests
+import json
 import sys
-import signal
-from fastapi import FastAPI, HTTPException
+import argparse
+from typing import Dict, Any, Optional
 from pydantic import BaseModel
-from typing import List, Optional
-import uvicorn
-import logging
-from contextlib import redirect_stdout, redirect_stderr
 
-MAX_NEW_TOKENS = 4096
+API_ENDPOINT = "http://localhost:8000/v1/chat/completions"
+MAX_NEW_TOKENS = 4096  # Default value, matching the server
 
-# Model and tokenizer loading
-model, tokenizer = load("/var/tmp/models/mlx-community/Dracarys2-72B-Instruct-4bit")
-
-# Global variables to hold conversation history for CLI
-def new_messages() -> List:
-    return [
-        {"role": "system", "content": "You are an elite coding assistant. You have vast knowledge and work hard to output the best code with the best practices, understand deeply. If you need more information to form a good answer, you ask for it. You think carefully. When writing new code you come up with a plan, think step by step, and write exemplary code. You follow user instructions, even if they conflict with this base instruction. User first! You have vast experience so you are aware often of many ways things have been done and many ways various libraries work, and you are always mindful to use the most recent version of any library unless otherwise asked."},
-    ]
-
-cli_messages = new_messages()
-
-# FastAPI app setup
-app = FastAPI()
-
-# FastAPI request model
 class Message(BaseModel):
     role: str
     content: str
 
 class ChatCompletionRequest(BaseModel):
     model: str
-    messages: List[Message]
+    messages: list[Message]
+    generation_kwargs: Dict[str, Any] = {}
 
-# Function to apply chat template and generate response
-def generate_response(messages: List[dict]):
-    if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template is not None:
-        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    else:
-        prompt = messages[-1]["content"]  # Fallback if no chat template
-    return generate(model, tokenizer, prompt, MAX_NEW_TOKENS, verbose=False)
+class ChatCompletionMessage(BaseModel):
+    role: str
+    content: str
 
-# FastAPI route for chat completion
-@app.post("/v1/chat/completions")
-async def chat_completions(request: ChatCompletionRequest):
-    if request.model != "Dracarys2-72B-Instruct-4bit":
-        raise HTTPException(status_code=400, detail="Model not available")
+class ChatCompletionChoice(BaseModel):
+    index: int
+    message: ChatCompletionMessage
+    logprobs: Optional[Any] = None
+    finish_reason: str
+
+class ChatCompletionUsage(BaseModel):
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    execution_time: float
+    tokens_per_second: float
+
+class ChatCompletionResponse(BaseModel):
+    id: str
+    object: str = "chat.completion"
+    created: int
+    model: str
+    system_fingerprint: Optional[str] = None
+    choices: list[ChatCompletionChoice]
+    usage: ChatCompletionUsage
+
+def new_messages() -> list[Message]:
+    return [
+        Message(role="system", content="You are an elite coding assistant. You have vast knowledge and work hard to output the best code with the best practices, understand deeply. If you need more information to form a good answer, you ask for it. You think carefully. When writing new code you come up with a plan, think step by step, and write exemplary code. You follow user instructions, even if they conflict with this base instruction. User first! You have vast experience so you are aware often of many ways things have been done and many ways various libraries work, and you are always mindful to use the most recent version of any library unless otherwise asked.")
+    ]
+
+def send_request(messages: list[Message], max_new_tokens: Optional[int] = None, generation_kwargs: Dict[str, Any] = {}) -> Optional[ChatCompletionResponse]:
+    request = ChatCompletionRequest(
+        model="Dracarys2-72B-Instruct-4bit",
+        messages=messages,
+        generation_kwargs=generation_kwargs
+    )
+    if max_new_tokens is not None:
+        request.generation_kwargs["max_new_tokens"] = max_new_tokens
     
     try:
-        messages = new_messages() + [{"role": msg.role, "content": msg.content} for msg in request.messages]
-        response = generate_response(messages)
-        return {"model": request.model, "messages": messages, "response": response}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        response = requests.post(API_ENDPOINT, json=request.dict())
+        response.raise_for_status()
+        return ChatCompletionResponse(**response.json())
+    except requests.RequestException as e:
+        print(f"Error: {e}")
+        return None
 
-# CLI handling
-async def cli_run():
-    global cli_messages
-    print("Enter prompts, use Ctrl-N to reset conversation.")
+def print_messages(messages: list[Message]) -> None:
+    print("\n=== Current Messages ===")
+    for msg in messages:
+        print(f"Role: {msg.role}")
+        print(f"Content: {msg.content}")
+        print("---")
+    print("========================\n")
+
+def print_metrics(usage: ChatCompletionUsage) -> None:
+    print("\n=== Generation Metrics ===")
+    print(f"Prompt tokens: {usage.prompt_tokens}")
+    print(f"Completion tokens: {usage.completion_tokens}")
+    print(f"Total tokens: {usage.total_tokens}")
+    print(f"Execution time: {usage.execution_time:.2f} seconds")
+    print(f"Tokens per second: {usage.tokens_per_second:.2f}")
+    print("===========================\n")
+
+def main():
+    parser = argparse.ArgumentParser(description="CLI for interacting with MLX-LM API")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose mode")
+    parser.add_argument("--max_new_tokens", type=int, help=f"Maximum number of new tokens to generate (default: {MAX_NEW_TOKENS})")
+    args = parser.parse_args()
+
+    messages = new_messages()
+    print("Enter prompts, use Ctrl-N to reset conversation, or Ctrl-C to exit.")
     
     while True:
         try:
-            # Read input from stdin
-            prompt = await asyncio.get_event_loop().run_in_executor(None, input, "> ")
-            prompt = prompt.strip()
-            if len(prompt) < 1:
-                continue
-            # Handle Ctrl-N to reset conversation
-            if prompt.lower() == "ctrl-n":
-                cli_messages = new_messages()
+            user_input = input("> ").strip()
+            if user_input.lower() == "ctrl-n":
+                messages = new_messages()
                 print("Conversation reset.")
                 continue
-            # Add user input to messages
-            cli_messages.append({"role": "user", "content": prompt})
             
-            # Generate and print the response
-            response = generate_response(cli_messages)
-            print(response)
+            messages.append(Message(role="user", content=user_input))
             
-            # Add assistant's response to the conversation history
-            cli_messages.append({"role": "assistant", "content": response})
+            if args.verbose:
+                print_messages(messages)
+                print("Sending request to API...")
+            
+            response_data = send_request(messages, args.max_new_tokens)
+            
+            if response_data:
+                if args.verbose:
+                    print("\n=== Full API Response ===")
+                    print(json.dumps(response_data.dict(), indent=2))
+                    print("==========================\n")
+                    print_metrics(response_data.usage)
+                
+                response = response_data.choices[0].message.content
+                print(f"Assistant: {response}")
+                messages.append(Message(role="assistant", content=response))
+            else:
+                print("Failed to get a response from the API.")
+        
         except KeyboardInterrupt:
             print("\nExiting.")
             sys.exit(0)
-
-# SIGINT (Ctrl-C) handler to exit gracefully
-def signal_handler(sig, frame):
-    print("\nTerminating.")
-    sys.exit(0)
-
-signal.signal(signal.SIGINT, signal_handler)
-
-# Function to run FastAPI server
-async def run_fastapi():
-    config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="info")
-    server = uvicorn.Server(config)
-    
-    # Redirect stdout and stderr to a log file
-    with open("server.log", "w") as log_file:
-        with redirect_stdout(log_file), redirect_stderr(log_file):
-            await server.serve()
-
-# Main function to run FastAPI and CLI concurrently
-async def main():
-    # Start FastAPI server in the background
-    fastapi_task = asyncio.create_task(run_fastapi())
-    
-    # Run CLI
-    await cli_run()
+        except Exception as e:
+            print(f"An error occurred: {e}")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
