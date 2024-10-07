@@ -2,6 +2,8 @@
 
 This project provides a FastAPI-based server (`server.py`) for serving MLX-LM models and a command-line client (`infer.py`) for interacting with the API.
 
+Dead simple but was just building something to wrap around mlx while driving and experimenting with dracarys-72b locally
+
 ## Server (server.py)
 
 The server script sets up a FastAPI application that serves MLX-LM models for chat completions.
