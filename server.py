@@ -12,6 +12,7 @@ import os
 import json
 import mlx.core as mx
 import asyncio
+import traceback
 
 app = FastAPI()
 
@@ -81,25 +82,23 @@ class ChatCompletionChunk(BaseModel):
     choices: List[Dict[str, Any]]
     usage: Optional[ChatCompletionUsage] = None
 
-def count_tokens(text, tokenizer):
-    return len(tokenizer.encode(text))
-
 def is_stop_token(token_id):
     stop_tokens = ["<|im_end|>", "<|endoftext|>"]
     return tokenizer.decode([token_id]) in stop_tokens
 
 def generate_with_metrics(model, tokenizer, prompt, max_new_tokens, **kwargs):
-    input_tokens = count_tokens(prompt, tokenizer)
+    input_tokens = len(prompt)
     start_time = time.time()
     response = ""
+    output_tokens = 0
     for token, _ in generate_step(prompt=prompt, model=model, **kwargs):
         if is_stop_token(token):
             break
         response += tokenizer.decode([token])
-        if len(response) >= max_new_tokens:
+        output_tokens += 1
+        if output_tokens >= max_new_tokens:
             break
     end_time = time.time()
-    output_tokens = count_tokens(response, tokenizer)
     total_tokens = input_tokens + output_tokens
     execution_time = end_time - start_time
     tokens_per_second = total_tokens / execution_time if execution_time > 0 else 0
@@ -231,7 +230,8 @@ async def chat_completions(request: ChatCompletionRequest):
         return response
     except Exception as e:
         logger.error(f"Error in chat_completions: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
