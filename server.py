@@ -21,7 +21,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Constants
-MAX_NEW_TOKENS = 4096
+MAX_NEW_TOKENS = 8192
 DEFAULT_MODEL_PATH = "/var/tmp/models/mlx-community/Dracarys2-72B-Instruct-4bit"
 
 # Parse command-line arguments
@@ -31,7 +31,26 @@ args = parser.parse_args()
 
 # Load model and tokenizer
 logger.info(f"Loading model from {args.model}...")
-model, tokenizer = load(args.model)
+
+# load configs
+config_path = os.path.join(DEFAULT_MODEL_PATH, "config.json")
+tokenizer_config_path = os.path.join(DEFAULT_MODEL_PATH, "tokenizer_config.json")
+if os.path.exists(config_path):
+    with open(config_path, 'r', encoding='utf-8') as f:
+        model_config = json.load(f)
+    logger.info("Model config loaded successfully.")
+else:
+    logger.warning("Model config not found.")
+
+# Load tokenizer config if available
+if os.path.exists(tokenizer_config_path):
+    with open(tokenizer_config_path, 'r', encoding='utf-8') as f:
+        tokenizer_config = json.load(f)
+    logger.info("Tokenizer config loaded successfully.")
+else:
+    logger.warning("Tokenizer config not found.")
+
+model, tokenizer = load(args.model, model_config=model_config, tokenizer_config=tokenizer_config)
 logger.info("Model and tokenizer loaded successfully.")
 
 # Extract model name from path or use the full path if it's a Hugging Face model
