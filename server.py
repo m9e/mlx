@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 # Constants
 MAX_NEW_TOKENS = 8192
-DEFAULT_MODEL_PATH = "/var/tmp/models/mlx-community/DeepSeek-V3-0324-4bit/"
+DEFAULT_MODEL_PATH = "/var/tmp/models/mlx-community/DeepSeek-V3-0324-4bit"
 
 # Parse command-line arguments
 parser = argparse.ArgumentParser(description="MLX-LM API Server")
@@ -54,7 +54,9 @@ model, tokenizer = load(args.model, model_config=model_config, tokenizer_config=
 logger.info("Model and tokenizer loaded successfully.")
 
 # Extract model name from path or use the full path if it's a Hugging Face model
-MODEL_NAME = os.path.basename(args.model) if os.path.exists(args.model) else args.model
+MODEL_NAME = args.model
+MODEL_NAME = MODEL_NAME.rstrip('/')
+MODEL_NAME = os.path.basename(MODEL_NAME) if os.path.exists(MODEL_NAME) else MODEL_NAME
 
 class Message(BaseModel):
     role: str
