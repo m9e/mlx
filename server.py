@@ -110,7 +110,7 @@ def generate_with_metrics(model, tokenizer, prompt, max_new_tokens, **kwargs):
     start_time = time.time()
     response = ""
     output_tokens = 0
-    for token, _ in generate_step(prompt=prompt, model=model, **kwargs):
+    for token, _ in generate_step(prompt=prompt, model=model, max_new_tokens=max_new_tokens, **kwargs):
         if is_stop_token(token):
             break
         response += tokenizer.decode([token])
@@ -141,7 +141,7 @@ async def generate_stream(prompt: mx.array, request: ChatCompletionRequest) -> A
     for token, _ in generate_step(
         prompt=prompt,
         model=model,
-        temp=request.temperature,
+        max_new_tokens=request.max_tokens,
         top_p=request.top_p
     ):
         if is_stop_token(token):
@@ -226,9 +226,7 @@ async def chat_completions(request: ChatCompletionRequest):
             model=model,
             tokenizer=tokenizer,
             prompt=prompt,
-            max_new_tokens=request.max_tokens,
-            temp=request.temperature,
-            top_p=request.top_p
+            max_new_tokens=request.max_tokens
         )
 
         response = ChatCompletionResponse(
