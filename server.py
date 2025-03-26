@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 # Constants
 MAX_NEW_TOKENS = 8192
-DEFAULT_MODEL_PATH = "/var/tmp/models/mlx-community/Dracarys2-72B-Instruct-4bit"
+DEFAULT_MODEL_PATH = "/var/tmp/models/mlx-community/DeepSeek-V3-0324-4bit/"
 
 # Parse command-line arguments
 parser = argparse.ArgumentParser(description="MLX-LM API Server")
