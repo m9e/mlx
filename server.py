@@ -255,11 +255,23 @@ async def generate_stream(prompt, request: ChatCompletionRequest) -> AsyncGenera
     yield f"data: {json.dumps(final_response.model_dump())}\n\n"
     yield "data: [DONE]\n\n"
 
+    
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
     try:
         if request.model != MODEL_NAME:
-            raise HTTPException(status_code=400, detail="Model not available")
+            available_models = [MODEL_NAME]
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": f"Model '{request.model}' not available. Available models: {', '.join(available_models)}",
+                        "type": "invalid_request_error",
+                        "param": "model",
+                        "code": "model_not_available"
+                    }
+                }
+            )
 
         messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
         
