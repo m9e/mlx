@@ -3,7 +3,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional, AsyncGenerator
-from mlx_lm.utils import generate_step, load
+from mlx_lm import load, stream_generate
+from mlx_lm.sample_utils import make_sampler, make_logits_processors
 import logging
 import time
 import uuid
@@ -13,6 +14,7 @@ import json
 import mlx.core as mx
 import asyncio
 import traceback
+from dataclasses import dataclass
 
 app = FastAPI()
 
@@ -27,14 +29,18 @@ DEFAULT_MODEL_PATH = "/var/tmp/models/mlx-community/DeepSeek-V3-0324-4bit"
 # Parse command-line arguments
 parser = argparse.ArgumentParser(description="MLX-LM API Server")
 parser.add_argument("-m", "--model", type=str, default=DEFAULT_MODEL_PATH, help="Model path or Hugging Face model name")
+parser.add_argument("--max-kv-size", type=int, default=None, help="Maximum KV cache size (optional)")
 args = parser.parse_args()
 
 # Load model and tokenizer
 logger.info(f"Loading model from {args.model}...")
 
-# load configs
+# Load configs
 config_path = os.path.join(DEFAULT_MODEL_PATH, "config.json")
 tokenizer_config_path = os.path.join(DEFAULT_MODEL_PATH, "tokenizer_config.json")
+model_config = None
+tokenizer_config = None
+
 if os.path.exists(config_path):
     with open(config_path, 'r', encoding='utf-8') as f:
         model_config = json.load(f)
@@ -68,6 +74,9 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: int = Field(default=MAX_NEW_TOKENS)
     temperature: float = 1.0
     top_p: float = 1.0
+    repetition_penalty: Optional[float] = None
+    repetition_context_size: Optional[int] = 20
+    max_kv_size: Optional[int] = None
     stream: bool = False
 
 class ChatCompletionMessage(BaseModel):
@@ -103,26 +112,50 @@ class ChatCompletionChunk(BaseModel):
     choices: List[Dict[str, Any]]
     usage: Optional[ChatCompletionUsage] = None
 
-def is_stop_token(token_id):
+def is_stop_token(token_str):
     stop_tokens = ["<|im_end|>", "<|endoftext|>"]
-    return tokenizer.decode([token_id]) in stop_tokens
+    return token_str in stop_tokens
 
 def generate_with_metrics(model, tokenizer, prompt, max_new_tokens, **kwargs):
-    input_tokens = len(prompt)
+    input_tokens = len(prompt) if isinstance(prompt, list) else len(tokenizer.encode(prompt))
     start_time = time.time()
+    
+    # Create sampler and logits processors based on kwargs
+    sampler = make_sampler(
+        temp=kwargs.get("temperature", 1.0),
+        top_p=kwargs.get("top_p", 1.0)
+    )
+    
+    logits_processors = make_logits_processors(
+        logit_bias=None,  # Not implemented in the request model
+        repetition_penalty=kwargs.get("repetition_penalty"),
+        repetition_context_size=kwargs.get("repetition_context_size", 20)
+    )
+    
     response = ""
     output_tokens = 0
-    for token, _ in generate_step(prompt=prompt, model=model, max_tokens=max_new_tokens, **kwargs):
-        if is_stop_token(token):
+    
+    for gen_output in stream_generate(
+        model=model,
+        tokenizer=tokenizer,
+        prompt=prompt,
+        max_tokens=max_new_tokens,
+        sampler=sampler,
+        logits_processors=logits_processors,
+        max_kv_size=kwargs.get("max_kv_size", args.max_kv_size)
+    ):
+        if is_stop_token(gen_output.text):
             break
-        response += tokenizer.decode([token])
+        response += gen_output.text
         output_tokens += 1
         if output_tokens >= max_new_tokens:
             break
+    
     end_time = time.time()
     total_tokens = input_tokens + output_tokens
     execution_time = end_time - start_time
     tokens_per_second = total_tokens / execution_time if execution_time > 0 else 0
+    
     metrics = ChatCompletionUsage(
         prompt_tokens=input_tokens,
         completion_tokens=output_tokens,
@@ -130,27 +163,44 @@ def generate_with_metrics(model, tokenizer, prompt, max_new_tokens, **kwargs):
         execution_time=execution_time,
         tokens_per_second=tokens_per_second
     )
+    
     return response, metrics
 
-async def generate_stream(prompt: mx.array, request: ChatCompletionRequest) -> AsyncGenerator[str, None]:
+async def generate_stream(prompt, request: ChatCompletionRequest) -> AsyncGenerator[str, None]:
     tokens = []
     created = int(time.time())
     response_id = f"chatcmpl-{uuid.uuid4()}"
     start_time = time.time()
     finish_reason = "stop"
     full_response = ""
-
-    for token, _ in generate_step(
-        prompt=prompt,
-        model=model,
-        max_tokens=request.max_tokens,
+    
+    # Create sampler and logits processors
+    sampler = make_sampler(
+        temp=request.temperature,
         top_p=request.top_p
+    )
+    
+    logits_processors = make_logits_processors(
+        logit_bias=None,  # Not implemented in the request model
+        repetition_penalty=request.repetition_penalty,
+        repetition_context_size=request.repetition_context_size
+    )
+    
+    for gen_output in stream_generate(
+        model=model,
+        tokenizer=tokenizer,
+        prompt=prompt,
+        max_tokens=request.max_tokens,
+        sampler=sampler,
+        logits_processors=logits_processors,
+        max_kv_size=request.max_kv_size or args.max_kv_size
     ):
-        if is_stop_token(token):
+        if is_stop_token(gen_output.text):
             finish_reason = "stop"
             break
-        tokens.append(token)
-        new_text = tokenizer.decode([token])
+            
+        tokens.append(gen_output.token)
+        new_text = gen_output.text
         full_response += new_text
         
         chunk = ChatCompletionChunk(
@@ -175,7 +225,7 @@ async def generate_stream(prompt: mx.array, request: ChatCompletionRequest) -> A
 
     end_time = time.time()
     execution_time = end_time - start_time
-    prompt_tokens = len(prompt)
+    prompt_tokens = len(prompt) if isinstance(prompt, list) else len(tokenizer.encode(prompt))
     completion_tokens = len(tokens)
     total_tokens = prompt_tokens + completion_tokens
     tokens_per_second = total_tokens / execution_time if execution_time > 0 else 0
@@ -213,22 +263,26 @@ async def chat_completions(request: ChatCompletionRequest):
 
         messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
         
+        # Handle chat template if available
         if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
-            prompt = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+            prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         else:
             prompt = " ".join([f"{msg['role']}: {msg['content']}" for msg in messages])
-            prompt = tokenizer.encode(prompt)
-
-        prompt = mx.array(prompt)
-
+        
         if request.stream:
             return StreamingResponse(generate_stream(prompt, request), media_type="text/event-stream")
         
+        # Non-streaming response
         full_response, metrics = generate_with_metrics(
             model=model,
             tokenizer=tokenizer,
             prompt=prompt,
-            max_new_tokens=request.max_tokens
+            max_new_tokens=request.max_tokens,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            repetition_penalty=request.repetition_penalty,
+            repetition_context_size=request.repetition_context_size,
+            max_kv_size=request.max_kv_size
         )
 
         response = ChatCompletionResponse(
