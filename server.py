@@ -91,7 +91,7 @@ def generate_with_metrics(model, tokenizer, prompt, max_new_tokens):
     output_tokens = 0
     
     # we are duplicating the effort to count
-    input_tokens = len(prompt) if isinstance(prompt, list) else len(tokenizer.encode(prompt))
+    input_tokens = len(prompt)
 
     logger.info(f"Starting generation with {input_tokens} input tokens")
     
@@ -131,7 +131,7 @@ async def generate_stream(prompt: mx.array, request: ChatCompletionRequest) -> A
     
     
     # Get actual input token count
-    input_tokens = len(prompt) if isinstance(prompt, list) else len(tokenizer.encode(prompt))
+    input_tokens = len(prompt)
 
     logger.info(f"Starting stream generation with {input_tokens} input tokens")
     
@@ -207,15 +207,16 @@ async def chat_completions(request: ChatCompletionRequest):
         if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
             # Modern way - make sure tokenize=True
             logger.info("Using chat template")
-            prompt = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+            prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
             # If prompt is not an array, convert it
-            if not isinstance(prompt, mx.array):
-                prompt = mx.array(prompt)
         else:
             # Fallback
             logger.info("Using fallback prompt formatting")
             prompt_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in messages])
-            prompt = mx.array(tokenizer.encode(prompt_text))
+
+        prompt = tokenizer.encode(prompt_text)
+        if not isinstance(prompt, mx.array):
+            prompt = mx.array(prompt)
         
         logger.info(f"Prompt prepared - {len(prompt)} tokens")
         
