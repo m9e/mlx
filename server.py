@@ -90,10 +90,10 @@ def generate_with_metrics(model, tokenizer, prompt, max_new_tokens):
     response_output = ""
     output_tokens = 0
     
-    logger.info(f"Starting generation with {len(prompt)} input tokens")
-
     # we are duplicating the effort to count
     input_tokens = len(prompt) if isinstance(prompt, list) else len(tokenizer.encode(prompt))
+
+    logger.info(f"Starting generation with {input_tokens} input tokens")
     
     # Let's try with only the required parameters
     for response in stream_generate(model=model, tokenizer=tokenizer, prompt=prompt, max_tokens=max_new_tokens):
@@ -129,10 +129,11 @@ async def generate_stream(prompt: mx.array, request: ChatCompletionRequest) -> A
     full_response = ""
     finish_reason = "stop"
     
-    logger.info(f"Starting stream generation with {input_tokens} input tokens")
     
     # Get actual input token count
     input_tokens = len(prompt) if isinstance(prompt, list) else len(tokenizer.encode(prompt))
+
+    logger.info(f"Starting stream generation with {input_tokens} input tokens")
     
     for response in stream_generate(model=model, tokenizer=tokenizer, prompt=prompt, max_tokens=request.max_tokens):
         full_response += response
