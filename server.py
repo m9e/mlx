@@ -86,7 +86,6 @@ class ChatCompletionChunk(BaseModel):
     usage: Optional[ChatCompletionUsage] = None
 
 def generate_with_metrics(model, tokenizer, prompt, max_new_tokens):
-    input_tokens = len(prompt)
     start_time = time.time()
     response_output = ""
     output_tokens = 0
@@ -94,7 +93,7 @@ def generate_with_metrics(model, tokenizer, prompt, max_new_tokens):
     logger.info(f"Starting generation with {len(prompt)} input tokens")
 
     # we are duplicating the effort to count
-    input_tokens = tokenizer.encode(prompt)
+    input_tokens = len(prompt) if isinstance(prompt, list) else len(tokenizer.encode(prompt))
     
     # Let's try with only the required parameters
     for response in stream_generate(model=model, tokenizer=tokenizer, prompt=prompt, max_tokens=max_new_tokens):
@@ -123,7 +122,6 @@ def generate_with_metrics(model, tokenizer, prompt, max_new_tokens):
     return response, metrics
 
 async def generate_stream(prompt: mx.array, request: ChatCompletionRequest) -> AsyncGenerator[str, None]:
-    input_tokens = len(prompt)
     start_time = time.time()
     created = int(time.time())
     response_id = f"chatcmpl-{uuid.uuid4()}"
@@ -134,7 +132,7 @@ async def generate_stream(prompt: mx.array, request: ChatCompletionRequest) -> A
     logger.info(f"Starting stream generation with {input_tokens} input tokens")
     
     # Get actual input token count
-    input_tokens = len(tokenizer.encode(prompt))
+    input_tokens = len(prompt) if isinstance(prompt, list) else len(tokenizer.encode(prompt))
     
     for response in stream_generate(model=model, tokenizer=tokenizer, prompt=prompt, max_tokens=request.max_tokens):
         full_response += response
