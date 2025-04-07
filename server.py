@@ -4,7 +4,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional, AsyncGenerator
 from mlx_lm import load, stream_generate
-from mlx_lm.utils import generate_step
+from mlx_lm.generate import generate_step
 import logging
 import time
 import uuid
@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Constants
-MAX_NEW_TOKENS = 32768
+MAX_NEW_TOKENS = 12288
 #DEFAULT_MODEL_PATH = "/var/tmp/models/mlx-community/QwQ-32B-8bit"
 DEFAULT_MODEL_PATH = "/var/tmp/models/mlx-community/DeepSeek-V3-0324-4bit"
 
@@ -97,7 +97,7 @@ def generate_with_metrics(model, tokenizer, prompt, max_new_tokens):
     
     # Let's try with only the required parameters
     for response in stream_generate(model=model, tokenizer=tokenizer, prompt=prompt, max_tokens=max_new_tokens):
-        response_output += response
+        response_output += response.text
         output_tokens += 1
 
         # circuit break  -should not happen
@@ -119,7 +119,7 @@ def generate_with_metrics(model, tokenizer, prompt, max_new_tokens):
         tokens_per_second=tokens_per_second
     )
     
-    return response, metrics
+    return response_output, metrics
 
 async def generate_stream(prompt: mx.array, request: ChatCompletionRequest) -> AsyncGenerator[str, None]:
     start_time = time.time()
@@ -136,7 +136,7 @@ async def generate_stream(prompt: mx.array, request: ChatCompletionRequest) -> A
     logger.info(f"Starting stream generation with {input_tokens} input tokens")
     
     for response in stream_generate(model=model, tokenizer=tokenizer, prompt=prompt, max_tokens=request.max_tokens):
-        full_response += response
+        full_response += response.text
         output_tokens += 1
         
         chunk = ChatCompletionChunk(
@@ -146,7 +146,7 @@ async def generate_stream(prompt: mx.array, request: ChatCompletionRequest) -> A
             choices=[
                 {
                     "index": 0,
-                    "delta": {"content": response},
+                    "delta": {"content": response.text},
                     "finish_reason": None
                 }
             ]
@@ -260,4 +260,4 @@ async def chat_completions(request: ChatCompletionRequest):
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=53100)
