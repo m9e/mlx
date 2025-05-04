@@ -1,256 +1,267 @@
-import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+#!/usr/bin/env python3
+"""
+Unified MLX Vision-Language server
+• /v1/chat/completions  (OpenAI compatible)
+• /v1/responses         (Azure/OpenAI “responses” API)
+Supports images (url | base64 | path) and video key-frames.
+"""
+
+import os, io, re, json, time, uuid, math, base64, tempfile, subprocess, asyncio, logging
+from typing import List, Dict, Any, Optional, Union, AsyncGenerator
+
+import uvicorn, requests
+from PIL import Image
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from typing import List, Dict, Any, Optional, AsyncGenerator
-from mlx_lm.utils import generate_step, load
-import logging
-import time
-import uuid
+
+import mlx.core as mx                   # CPU/GPU device picked automatically (Apple Silicon ok)
+from mlx_vlm import load, generate, apply_chat_template
+from mlx_vlm.utils import stream_generate
+
+# ───────────────────────────── CLI ───────────────────────────────
 import argparse
-import os
-import json
-import mlx.core as mx
-import asyncio
-import traceback
-
-app = FastAPI()
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Constants
-MAX_NEW_TOKENS = 8192
-DEFAULT_MODEL_PATH = "/var/tmp/models/mlx-community/DeepSeek-V3-0324-4bit"
-
-# Parse command-line arguments
-parser = argparse.ArgumentParser(description="MLX-LM API Server")
-parser.add_argument("-m", "--model", type=str, default=DEFAULT_MODEL_PATH, help="Model path or Hugging Face model name")
+parser = argparse.ArgumentParser(description="MLX VL-server")
+parser.add_argument("-m","--model", default="mlx-community/Qwen2-VL-2B-Instruct-4bit")
+parser.add_argument("--port", type=int, default=8005)
+parser.add_argument("--strip-thinking", action="store_true")
+parser.add_argument("--ffmpeg", default="ffmpeg")
+parser.add_argument("--default-frames", type=int, default=4)
+parser.add_argument("--patch-cap", action="store_true",
+                    help="Rescale images so #32-px patches ≤ 1536 (OpenAI style)")
 args = parser.parse_args()
 
-# Load model and tokenizer
-logger.info(f"Loading model from {args.model}...")
+MAX_NEW_TOKENS = 512
+PATCH_LIMIT = 1536
+PATCH_SIZE  = 32
+STRIP_RE    = re.compile(r"<think>.*?</think>", re.I|re.S)
+LOG         = logging.getLogger("vlm-srv")
+logging.basicConfig(level=logging.INFO)
 
-# load configs
-config_path = os.path.join(DEFAULT_MODEL_PATH, "config.json")
-tokenizer_config_path = os.path.join(DEFAULT_MODEL_PATH, "tokenizer_config.json")
-if os.path.exists(config_path):
-    with open(config_path, 'r', encoding='utf-8') as f:
-        model_config = json.load(f)
-    logger.info("Model config loaded successfully.")
-else:
-    logger.warning("Model config not found.")
+# ────────────────────── model / processor load ───────────────────
+def load_model_and_processor(model_path:str):
+    lower = model_path.lower()
+    if "qwen" in lower and "vl" in lower:
+        # use qwen-vl-utils AutoProcessor (handles dynamic resize, bbox return, etc.)
+        from transformers import AutoProcessor, AutoModelForVision2Seq
+        LOG.info("Detected Qwen-VL – loading with transformers AutoProcessor")
+        model = AutoModelForVision2Seq.from_pretrained(model_path, trust_remote_code=True)
+        processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+        return model, processor
+    # default MLX loader (covers Llava-1.6, BLIP-2, etc.)
+    cfg_path = os.path.join(model_path,"config.json")
+    cfg = json.load(open(cfg_path)) if os.path.exists(cfg_path) else {}
+    return load(model_path, **cfg)
 
-# Load tokenizer config if available
-if os.path.exists(tokenizer_config_path):
-    with open(tokenizer_config_path, 'r', encoding='utf-8') as f:
-        tokenizer_config = json.load(f)
-    logger.info("Tokenizer config loaded successfully.")
-else:
-    logger.warning("Tokenizer config not found.")
+MODEL, PROCESSOR = load_model_and_processor(args.model)
+MODEL_NAME = os.path.basename(args.model) if os.path.exists(args.model) else args.model
+LOG.info("Loaded model %s", MODEL_NAME)
 
-model, tokenizer = load(args.model, model_config=model_config, tokenizer_config=tokenizer_config)
-logger.info("Model and tokenizer loaded successfully.")
+# ─────────────────────── data classes ────────────────────────────
+class ChatMsg(BaseModel):
+    role:str
+    content:str
 
-# Extract model name from path or use the full path if it's a Hugging Face model
-MODEL_NAME = args.model
-MODEL_NAME = MODEL_NAME.rstrip('/')
-MODEL_NAME = os.path.basename(MODEL_NAME) if os.path.exists(MODEL_NAME) else MODEL_NAME
+class ChatReq(BaseModel):
+    model:str = MODEL_NAME
+    messages:List[ChatMsg]
+    images:List[str] = Field(default_factory=list)
+    videos:List[Dict[str,Any]] = Field(default_factory=list)
+    max_tokens:int = MAX_NEW_TOKENS
+    temperature:float = 1.0
+    top_p:float = 1.0
+    stream:bool = False
+    resize_shape:Optional[List[int]] = None
+    strip_thinking:Optional[bool] = None
+    stripThinking:Optional[bool] = None
 
-class Message(BaseModel):
-    role: str
-    content: str
+class RespReq(BaseModel):
+    model:str = MODEL_NAME
+    input:Union[str,List[Dict[str,Any]]]
+    previous_response_id:Optional[str] = None
+    stream:bool = False
+    temperature:float = 1.0
+    top_p:float = 1.0
+    max_output_tokens:Optional[int] = None
+    images:List[str] = Field(default_factory=list)
+    videos:List[Dict[str,Any]] = Field(default_factory=list)
+    strip_thinking:Optional[bool] = None
+    stripThinking:Optional[bool] = None
 
-class ChatCompletionRequest(BaseModel):
-    model: str
-    messages: List[Message]
-    max_tokens: int = Field(default=MAX_NEW_TOKENS)
-    temperature: float = 1.0
-    top_p: float = 1.0
-    stream: bool = False
+class Usage(BaseModel):
+    input_tokens:int
+    output_tokens:int
+    total_tokens:int
+    tokens_per_second:float
 
-class ChatCompletionMessage(BaseModel):
-    role: str
-    content: str
+# ─────────────────────── helpers ─────────────────────────────────
+STATE:Dict[str,List[Dict[str,str]]] = {}
 
-class ChatCompletionChoice(BaseModel):
-    index: int
-    message: ChatCompletionMessage
-    logprobs: Optional[Any] = None
-    finish_reason: str
+def _strip_thinks(text:str, on:bool)->str:
+    return STRIP_RE.sub("", text) if on else text
 
-class ChatCompletionUsage(BaseModel):
-    prompt_tokens: int
-    completion_tokens: int
-    total_tokens: int
-    execution_time: float
-    tokens_per_second: float
+def _apply_patch_cap(img:Image.Image)->Image.Image:
+    if not args.patch_cap: return img
+    w,h = img.size
+    patches = math.ceil(w/PATCH_SIZE)*math.ceil(h/PATCH_SIZE)
+    if patches<=PATCH_LIMIT: return img
+    scale = math.sqrt(PATCH_LIMIT/patches)
+    new_w,new_h = int(w*scale), int(h*scale)
+    return img.resize((new_w,new_h), Image.BICUBIC)
 
-class ChatCompletionResponse(BaseModel):
-    id: str
-    object: str
-    created: int
-    model: str
-    choices: List[ChatCompletionChoice]
-    usage: ChatCompletionUsage
+def _load_one_image(ref:str)->Image.Image:
+    if ref.startswith("data:image/"):
+        _,b64 = ref.split(",",1)
+        img = Image.open(io.BytesIO(base64.b64decode(b64)))
+    elif ref.startswith("http://") or ref.startswith("https://"):
+        img = Image.open(io.BytesIO(requests.get(ref, timeout=15).content))
+    else:
+        img = Image.open(ref)
+    return _apply_patch_cap(img.convert("RGB"))
 
-class ChatCompletionChunk(BaseModel):
-    id: str
-    object: str = "chat.completion.chunk"
-    created: int
-    model: str
-    choices: List[Dict[str, Any]]
-    usage: Optional[ChatCompletionUsage] = None
+def _video_to_frames(url:str, n:int)->List[Image.Image]:
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        if url.startswith("http"):
+            tmp.write(requests.get(url, timeout=30).content)
+        else:
+            tmp.write(open(url,"rb").read())
+        tmp.flush()
+        # evenly spaced frames
+        out_dir = tempfile.mkdtemp()
+        cmd = [args.ffmpeg,"-y","-i",tmp.name,
+               "-vf",f"fps={n}/$(ffprobe -v 0 -show_entries format=duration "
+                     f"-of default=nw=1:nk=1 {tmp.name})",
+               os.path.join(out_dir,"%04d.png")]
+        subprocess.run(" ".join(cmd), shell=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        files = sorted(os.listdir(out_dir))[:n]
+        return [_apply_patch_cap(Image.open(os.path.join(out_dir,f)).convert("RGB"))
+                for f in files]
 
-def is_stop_token(token_id):
-    stop_tokens = ["<|im_end|>", "<|endoftext|>"]
-    return tokenizer.decode([token_id]) in stop_tokens
+def collect_images(images:List[str], videos:List[Dict[str,Any]])->List[Image.Image]:
+    out=[]
+    for ref in images:
+        out.append(_load_one_image(ref))
+    for vid in videos:
+        frames = vid.get("frames", args.default_frames)
+        out.extend(_video_to_frames(vid["url"], frames))
+    return out
 
-def generate_with_metrics(model, tokenizer, prompt, max_new_tokens, **kwargs):
-    input_tokens = len(prompt)
-    start_time = time.time()
-    response = ""
-    output_tokens = 0
-    for token, _ in generate_step(prompt=prompt, model=model, max_tokens=max_new_tokens, **kwargs):
-        if is_stop_token(token):
-            break
-        response += tokenizer.decode([token])
-        output_tokens += 1
-        if output_tokens >= max_new_tokens:
-            break
-    end_time = time.time()
-    total_tokens = input_tokens + output_tokens
-    execution_time = end_time - start_time
-    tokens_per_second = total_tokens / execution_time if execution_time > 0 else 0
-    metrics = ChatCompletionUsage(
-        prompt_tokens=input_tokens,
-        completion_tokens=output_tokens,
-        total_tokens=total_tokens,
-        execution_time=execution_time,
-        tokens_per_second=tokens_per_second
+def build_prompt(msgs:List[Dict], num_imgs:int)->str:
+    return apply_chat_template(
+        PROCESSOR,
+        config=getattr(MODEL,"config",{}).__dict__ if hasattr(MODEL,"config") else {},
+        prompt=msgs,
+        num_images=num_imgs
     )
-    return response, metrics
 
-async def generate_stream(prompt: mx.array, request: ChatCompletionRequest) -> AsyncGenerator[str, None]:
-    tokens = []
-    created = int(time.time())
-    response_id = f"chatcmpl-{uuid.uuid4()}"
-    start_time = time.time()
-    finish_reason = "stop"
-    full_response = ""
+def sync_generate(msgs:List[Dict], pil_imgs:List[Image.Image],
+                  max_toks:int,temp:float,top_p:float,strip:bool):
+    prompt = build_prompt(msgs, len(pil_imgs))
+    t0=time.time()
+    out = generate(MODEL, PROCESSOR, prompt=prompt, image=pil_imgs,
+                   max_tokens=max_toks, temp=temp, top_p=top_p, verbose=False)
+    out = _strip_thinks(out, strip)
+    dt=time.time()-t0; usage=Usage(input_tokens=len(prompt),
+                                   output_tokens=len(out),
+                                   total_tokens=len(prompt)+len(out),
+                                   tokens_per_second=(len(prompt)+len(out))/max(dt,1e-6))
+    return out,usage
 
-    for token, _ in generate_step(
-        prompt=prompt,
-        model=model,
-        max_tokens=request.max_tokens,
-        top_p=request.top_p
-    ):
-        if is_stop_token(token):
-            finish_reason = "stop"
-            break
-        tokens.append(token)
-        new_text = tokenizer.decode([token])
-        full_response += new_text
-        
-        chunk = ChatCompletionChunk(
-            id=response_id,
-            created=created,
-            model=request.model,
-            choices=[
-                {
-                    "index": 0,
-                    "delta": {"content": new_text},
-                    "finish_reason": None
-                }
-            ]
-        )
-        yield f"data: {json.dumps(chunk.model_dump())}\n\n"
-        
-        if len(tokens) >= request.max_tokens:
-            finish_reason = "length"
-            break
-        
+async def stream_generate_chunks(req_id:str, prompt:str, pil_imgs:List[Image.Image],
+                                 max_toks:int,temp:float,top_p:float,
+                                 strip:bool, created:int)->AsyncGenerator[str,None]:
+    inside=False; seen=0
+    async for res in stream_generate(MODEL,PROCESSOR,
+                                     prompt,image=pil_imgs,
+                                     max_tokens=max_toks,temp=temp,top_p=top_p):
+        chunk=res.text
+        if strip:
+            buf=""; i=0
+            while i<len(chunk):
+                if not inside and chunk.startswith("<think>",i):
+                    inside=True; i+=7; continue
+                if inside and chunk.startswith("</think>",i):
+                    inside=False; i+=8; continue
+                if inside: i+=1; continue
+                buf+=chunk[i]; 
+                if chunk[i].strip(): seen+=1
+                i+=1
+            chunk = buf if seen<4 else chunk
+        if not chunk: continue
+        payload={"id":req_id,"object":"chat.completion.chunk","created":created,
+                 "model":MODEL_NAME,"choices":[{"index":0,"delta":{"content":chunk},
+                                                "finish_reason":None}]}
+        yield f"data: {json.dumps(payload,ensure_ascii=False)}\n\n"
         await asyncio.sleep(0)
 
-    end_time = time.time()
-    execution_time = end_time - start_time
-    prompt_tokens = len(prompt)
-    completion_tokens = len(tokens)
-    total_tokens = prompt_tokens + completion_tokens
-    tokens_per_second = total_tokens / execution_time if execution_time > 0 else 0
+# ─────────────────────────── app ─────────────────────────────────
+app = FastAPI()
 
-    usage_info = ChatCompletionUsage(
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        total_tokens=total_tokens,
-        execution_time=execution_time,
-        tokens_per_second=tokens_per_second
-    )
-
-    final_response = ChatCompletionResponse(
-        id=response_id,
-        object="chat.completion",
-        created=created,
-        model=request.model,
-        choices=[
-            ChatCompletionChoice(
-                index=0,
-                message=ChatCompletionMessage(role="assistant", content=full_response.strip()),
-                finish_reason=finish_reason
-            )
-        ],
-        usage=usage_info
-    )
-    yield f"data: {json.dumps(final_response.model_dump())}\n\n"
-    yield "data: [DONE]\n\n"
+def _strip_flag(body)->bool:
+    return bool(getattr(body,"strip_thinking",False) or
+                getattr(body,"stripThinking",False) or
+                args.strip_thinking)
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: ChatCompletionRequest):
-    try:
-        if request.model != MODEL_NAME:
-            raise HTTPException(status_code=400, detail="Model not available")
+async def chat_completions(body:ChatReq):
+    if body.model!=MODEL_NAME:
+        raise HTTPException(400,f"Model {body.model} not loaded.")
+    pil_imgs = collect_images(body.images, body.videos)
+    strip=_strip_flag(body)
+    if not body.stream:
+        txt,usage = sync_generate([m.model_dump() for m in body.messages], pil_imgs,
+                                  body.max_tokens, body.temperature, body.top_p, strip)
+        return {"id":f"chatcmpl-{uuid.uuid4()}","object":"chat.completion",
+                "created":int(time.time()),"model":MODEL_NAME,
+                "choices":[{"index":0,"message":{"role":"assistant","content":txt},
+                            "finish_reason":"stop"}],
+                "usage":usage.model_dump()}
+    prompt = build_prompt([m.model_dump() for m in body.messages], len(pil_imgs))
+    req_id=f"chatcmpl-{uuid.uuid4()}"; created=int(time.time())
+    gen=stream_generate_chunks(req_id,prompt,pil_imgs,
+                               body.max_tokens,body.temperature,body.top_p,
+                               strip,created)
+    return StreamingResponse(gen,media_type="text/event-stream")
 
-        messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
-        
-        if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
-            prompt = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
-        else:
-            prompt = " ".join([f"{msg['role']}: {msg['content']}" for msg in messages])
-            prompt = tokenizer.encode(prompt)
+@app.post("/v1/responses")
+async def responses(body:RespReq):
+    if body.model!=MODEL_NAME:
+        raise HTTPException(400,"unknown model")
+    history=STATE.get(body.previous_response_id,[])
+    if isinstance(body.input,str):
+        history.append({"role":"user","content":body.input})
+    else:
+        history += [{"role":m.get("role","user"),"content":m.get("content","")}
+                    for m in body.input]
+    pil_imgs = collect_images(body.images, body.videos)
+    strip=_strip_flag(body)
+    max_tok = body.max_output_tokens or MAX_NEW_TOKENS
+    if not body.stream:
+        txt,usage = sync_generate(history,pil_imgs,max_tok,
+                                  body.temperature,body.top_p,strip)
+        resp_id=f"resp_{uuid.uuid4().hex}"
+        STATE[resp_id]=history+[{"role":"assistant","content":txt}]
+        return {"id":resp_id,"object":"response","created_at":time.time(),
+                "model":MODEL_NAME,
+                "output":[{"id":"msg_"+uuid.uuid4().hex,"type":"message",
+                           "role":"assistant",
+                           "content":[{"type":"output_text","text":txt}]}],
+                "output_text":txt,"temperature":body.temperature,"top_p":body.top_p,
+                "previous_response_id":body.previous_response_id,
+                "status":"completed","usage":usage.model_dump()}
+    prompt = build_prompt(history, len(pil_imgs))
+    resp_id=f"resp_{uuid.uuid4().hex}"; created=int(time.time())
+    async def gen():
+        async for chunk in stream_generate_chunks(resp_id,prompt,pil_imgs,
+                                                  max_tok,body.temperature,body.top_p,
+                                                  strip,created):
+            yield chunk
+        STATE[resp_id]=history
+        yield "data: [DONE]\n\n"
+    return StreamingResponse(gen(),media_type="text/event-stream")
 
-        prompt = mx.array(prompt)
-
-        if request.stream:
-            return StreamingResponse(generate_stream(prompt, request), media_type="text/event-stream")
-        
-        full_response, metrics = generate_with_metrics(
-            model=model,
-            tokenizer=tokenizer,
-            prompt=prompt,
-            max_new_tokens=request.max_tokens
-        )
-
-        response = ChatCompletionResponse(
-            id=f"chatcmpl-{uuid.uuid4()}",
-            object="chat.completion",
-            created=int(time.time()),
-            model=request.model,
-            choices=[
-                ChatCompletionChoice(
-                    index=0,
-                    message=ChatCompletionMessage(role="assistant", content=full_response.strip()),
-                    finish_reason="length" if len(full_response) >= request.max_tokens else "stop"
-                )
-            ],
-            usage=metrics
-        )
-
-        return response
-    except Exception as e:
-        logger.error(f"Error in chat_completions: {str(e)}")
-        logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
+# ───────────────────────── main ──────────────────────────────────
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    LOG.info("Server ready on :%d  (model %s)", args.port, MODEL_NAME)
+    uvicorn.run(app, host="0.0.0.0", port=args.port)

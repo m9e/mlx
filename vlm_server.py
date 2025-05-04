@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 # Default constants
 MAX_NEW_TOKENS = 512
-DEFAULT_MODEL_PATH = "/var/tmp/models/mlx-community/Qwen2-VL-2B-Instruct-4bit"
+DEFAULT_MODEL_PATH = "mlx-community/Qwen2-VL-2B-Instruct-4bit"
 
 # Command-line args
 parser = argparse.ArgumentParser(description="Vision Language Inference Server")
@@ -274,6 +274,7 @@ async def do_generate_stream(
 # -------------------------------
 
 @app.post("/v1/vl/complete")
+@app.post("/v1/chat/completions")
 async def vision_language_inference(vl_req: VLRequest):
     """
     Handle a request to generate text from both images & textual prompt.
@@ -342,4 +343,4 @@ async def vision_language_inference(vl_req: VLRequest):
 
 # Entry point
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8005)
