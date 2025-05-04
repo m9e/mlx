@@ -68,8 +68,8 @@ class ChatReq(BaseModel):
     images:List[str] = Field(default_factory=list)
     videos:List[Dict[str,Any]] = Field(default_factory=list)
     max_tokens:int = MAX_NEW_TOKENS
-    temperature:float = 1.0
-    top_p:float = 1.0
+    temperature:float = 0.7
+    top_p:float = 0.95
     stream:bool = False
     resize_shape:Optional[List[int]] = None
     strip_thinking:Optional[bool] = None
@@ -80,8 +80,8 @@ class RespReq(BaseModel):
     input:Union[str,List[Dict[str,Any]]]
     previous_response_id:Optional[str] = None
     stream:bool = False
-    temperature:float = 1.0
-    top_p:float = 1.0
+    temperature:float = 0.7
+    top_p:float = 0.95
     max_output_tokens:Optional[int] = None
     images:List[str] = Field(default_factory=list)
     videos:List[Dict[str,Any]] = Field(default_factory=list)
