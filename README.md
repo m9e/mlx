@@ -1,75 +1,118 @@
-# MLX-LM API Server and Client
+# MLX-LM 🦙 — Drop-in OpenAI-style API for any local MLX model
 
-This project provides a FastAPI-based server (`server.py`) for serving MLX-LM models and a command-line client (`infer.py`) for interacting with the API.
+A FastAPI micro-server (server.py) that speaks the OpenAI
+`/v1/chat/completions` dialect, plus a tiny CLI client
+(`infer.py`) for quick experiments.
+Ideal for poking at huge models like Dracarys-72B on an
+M4-Max/Studio, hacking on prompts, or piping the output straight into
+other tools that already understand the OpenAI schema.
 
-Dead simple but was just building something to wrap around mlx while driving and experimenting with dracarys-72b locally
+---
 
-## Server (server.py)
+## ✨ Highlight reel
 
-The server script sets up a FastAPI application that serves MLX-LM models for chat completions.
+| Feature | Details |
+|---------|---------|
+| 🔌 OpenAI compatible | Same request / response JSON (streaming too) – just change the base-URL. |
+| 📦 Zero-config | Point at a local folder or HuggingFace repo (`-m /path/to/model`). |
+| 🖼️ Vision-ready | Accepts `{"type":"image_url", …}` parts & base64 URLs – works with Qwen-VL & friends. |
+| 🎥 Video-aware | Auto-extracts N key-frames with ffmpeg and feeds them as images. |
+| 🧮 Usage metrics | Prompt / completion tokens + tokens-per-second in every response. |
+| ⚙️ CLI playground | `infer.py` gives you a REPL with reset (Ctrl-N), verbose mode, max-token flag… |
 
-### Features:
-- Loads and serves MLX-LM models
-- Provides a `/v1/chat/completions` endpoint compatible with OpenAI's API
-- Supports custom generation parameters
-- Includes metrics for token usage and generation speed
+---
 
-### Usage:
+## 🚀 Running the server
 
-To run the server:
+```bash
+# minimal
+python server.py -m /var/tmp/models/mlx-community/Dracarys2-72B-Instruct-4bit
 
-```
-python server.py -m /path/to/your/model
-```
-
-Optional arguments:
-- `-m` or `--model`: Specify the path to the MLX-LM model (default: "/var/tmp/models/mlx-community/Dracarys2-72B-Instruct-4bit")
-
-The server will start on `http://0.0.0.0:8000` by default.
-
-## Client (infer.py)
-
-The client script provides a command-line interface for interacting with the MLX-LM API server.
-
-### Features:
-- Interactive chat-like interface
-- Supports conversation reset (Ctrl-N)
-- Verbose mode for detailed API responses
-- Customizable maximum token generation
-
-### Usage:
-
-To run the client:
-
-```
-python infer.py [options]
+# custom port / host
+python server.py -m ./Qwen2.5-VL-72B-Instruct-6bit --host 0.0.0.0 --port 12345
 ```
 
-Optional arguments:
-- `-v` or `--verbose`: Enable verbose mode to see detailed API responses and metrics
-- `--max_new_tokens`: Set the maximum number of new tokens to generate (default: 4096)
+Default host/port: `0.0.0.0:18000`
 
-### Interacting with the Client:
-- Enter your prompts at the `>` prompt
-- Use `Ctrl-N` to reset the conversation
-- Use `Ctrl-C` to exit the program
+### Most useful flags:
 
-## API Endpoint
+| Flag | Default | What it does |
+|------|---------|--------------|
+| `-m / --model` | `mlx-community/Qwen2-VL-2B-Instruct-4bit` | Path or HF repo. |
+| `--strip-thinking` | off | Removes `<think>…</think>` blocks from model output. |
+| `--default-frames` | 4 | How many frames to grab per video URL. |
+| `--col-a / --col-b` | qwen / vl | Tokens that trigger the special Qwen-VL vision pipeline. |
 
-The server provides a single endpoint for chat completions:
+---
 
-- **URL**: `/v1/chat/completions`
-- **Method**: POST
-- **Request Body**: JSON object with the following structure:
-  ```json
-  {
-    "model": "model_name",
-    "messages": [
-      {"role": "user", "content": "Your message here"}
-    ],
-    "generation_kwargs": {}
+## 💬 Talking to it with the CLI
+
+```bash
+python infer.py --base-url http://localhost:18000/v1 -v --max_new_tokens 2048
+```
+
+### Interactive keys
+- Ctrl-N: reset conversation
+- Ctrl-C: quit
+
+---
+
+## 🌐 HTTP API
+
+POST `/v1/chat/completions`
+
+```json
+{
+  "model": "Dracarys2-72B-Instruct-4bit",
+  "messages": [
+    { "role": "user",
+      "content": [
+        { "type": "text", "text": "Describe this image." },
+        { "type": "image_url",
+          "image_url": { "url": "data:image/jpeg;base64,..." } }
+      ]
+    }
+  ],
+  "max_tokens": 512,
+  "stream": false
+}
+```
+
+Response (truncated):
+
+```json
+{
+  "id": "chatcmpl-d4c5…",
+  "object": "chat.completion",
+  "created": 1715242800,
+  "model": "Dracarys2-72B-Instruct-4bit",
+  "choices": [
+    {
+      "index": 0,
+      "message": { "role": "assistant", "content": "The image shows…" },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 143,
+    "completion_tokens": 87,
+    "total_tokens": 230,
+    "tokens_per_second": 32.1
   }
-  ```
-- **Response**: JSON object containing the generated response and usage statistics
+}
+```
 
-For more details on the API structure and usage, refer to the `ChatCompletionRequest` and `ChatCompletionResponse` classes in the server code.
+Add `"stream": true` and you'll get Server-Sent Events chunks followed by
+`data: [DONE]`.
+
+---
+
+## 🛠️ Internals (two-sentence tour)
+
+* **server.py** – loads the model with mlx-vlm, converts incoming
+OpenAI vision messages to the model's chat-template, handles images /
+video frames, and streams tokens back.
+* **infer.py** – lightweight REPL that keeps conversation context and
+shows latency / TPS stats.
+
+That's it – drop it in front of any MLX model and start chatting!
